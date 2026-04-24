@@ -1,0 +1,5 @@
+yt-dlp==2024.4.9
+moviepy==1.0.3
+Pillow==10.1.0
+imageio==2.35.1
+imageio-ffmpeg==0.5.1

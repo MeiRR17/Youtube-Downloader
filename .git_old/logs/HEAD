@@ -1,0 +1,7 @@
+0000000000000000000000000000000000000000 f4553b505314c2517ca94b5f592ddfe09f671a6e DevTeam770 <devteam770@github.com> 1777022513 +0300	commit (initial): first commit
+f4553b505314c2517ca94b5f592ddfe09f671a6e 3b7df195d2249f1b47a69132e1b1d3485d2e823d DevTeam770 <devteam770@github.com> 1777022872 +0300	commit: Initial commit: YouTube Video Downloader with GUI - Desktop application for downloading and processing YouTube videos with speed enhancement and smart topic organization
+3b7df195d2249f1b47a69132e1b1d3485d2e823d b7d7cb968c8f56f5fd3c849defe9e3b334331216 DevTeam770 <devteam770@github.com> 1777043535 +0300	commit: final_exe
+b7d7cb968c8f56f5fd3c849defe9e3b334331216 e3f14e742754d7f50985d0cc9b0f6ad4a050ad92 DevTeam770 <devteam770@github.com> 1777043991 +0300	commit: Add lightweight version without FFmpeg
+e3f14e742754d7f50985d0cc9b0f6ad4a050ad92 8019ccf0f1181f78e23614778db44a758aa07e5a DevTeam770 <devteam770@github.com> 1777044050 +0300	commit: Remove large FFmpeg files for GitHub
+8019ccf0f1181f78e23614778db44a758aa07e5a 7516871c1767e86bf10738c0eec1c8df2187d5de DevTeam770 <devteam770@github.com> 1777044122 +0300	commit: Add .gitignore to exclude large FFmpeg files
+7516871c1767e86bf10738c0eec1c8df2187d5de 8019ccf0f1181f78e23614778db44a758aa07e5a DevTeam770 <devteam770@github.com> 1777044192 +0300	reset: moving to HEAD~1
