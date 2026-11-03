@@ -1,3 +1,7 @@
+> **Script consolidation (2026-11-03):** Selected utility scripts from this repository were integrated into [Learning_Modules/tools/youtube-downloader](https://github.com/MeiRR17/Learning_Modules/tree/main/tools/youtube-downloader), via [PR #4](https://github.com/MeiRR17/Learning_Modules/pull/4). The import includes source provenance and CI syntax/content checks. The original repository remains accessible, may contain additional data or configuration, and has **not been archived or deleted**. Consult the consolidated README for exclusions and portability changes.
+
+---
+
 # YouTube Video Downloader
 
 A Python script that downloads YouTube videos, increases their speed by 1.5x, manages quality for large files, and organizes them by topic.
