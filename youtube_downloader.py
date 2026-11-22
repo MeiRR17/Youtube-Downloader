@@ -173,24 +173,28 @@ class YouTubeDownloader:
             raise FileNotFoundError("yt-dlp completed without an output file in the topic folder")
     
     def reduce_video_quality(self, video_path, max_size_mb=480):
-        """Reduce video quality to meet size requirements"""
-        video = VideoFileClip(str(video_path))
-        
-        # Try different quality settings
+        """Try smaller MP4 encodings without deleting a usable original."""
         quality_settings = [
             {'height': 480, 'bitrate': '500k'},
             {'height': 360, 'bitrate': '300k'},
             {'height': 240, 'bitrate': '200k'},
         ]
-        
         for settings in quality_settings:
-            temp_path = video_path.parent / f"temp_{video_path.name}"
-            
+            video = None
+            resized_video = None
+            temporary = None
             try:
-                # Resize and compress
-                resized_video = video.resize(height=settings['height'])
+                descriptor, name = tempfile.mkstemp(
+                    prefix=".quality-", suffix=".mp4", dir=video_path.parent
+                )
+                os.close(descriptor)
+                temporary = Path(name)
+                video = VideoFileClip(str(video_path))
+                resized_video = video.resize(
+                    height=min(settings['height'], video.h)
+                )
                 resized_video.write_videofile(
-                    str(temp_path),
+                    str(temporary),
                     bitrate=settings['bitrate'],
                     audio_bitrate='64k',
                     codec='libx264',
@@ -198,27 +202,35 @@ class YouTubeDownloader:
                     verbose=False,
                     logger=None
                 )
-                
-                # Check file size
-                temp_size_mb = temp_path.stat().st_size / (1024 * 1024)
-                
-                if temp_size_mb <= max_size_mb:
-                    # Replace original with compressed version
+                size = temporary.stat().st_size
+                if not 0 < size <= max_size_mb * 1024 * 1024:
+                    continue
+
+                resized_video.close()
+                resized_video = None
+                video.close()
+                video = None
+                final_path = video_path.with_suffix('.mp4')
+                os.replace(temporary, final_path)
+                temporary = None
+                if final_path != video_path:
                     video_path.unlink()
-                    temp_path.rename(video_path)
-                    logger.info(f"Reduced video quality to {settings['height']}p, size: {temp_size_mb:.1f}MB")
-                    break
-                else:
-                    temp_path.unlink()
-                    
-            except Exception as e:
-                logger.error(f"Error reducing quality: {e}")
-                if temp_path.exists():
-                    temp_path.unlink()
-                continue
-        
-        video.close()
-    
+                logger.info(
+                    f"Reduced video quality to {settings['height']}p, "
+                    f"size: {size / (1024 * 1024):.1f}MB"
+                )
+                return final_path
+            except Exception as exc:
+                logger.error(f"Error reducing quality: {exc}")
+            finally:
+                if resized_video is not None:
+                    resized_video.close()
+                if video is not None:
+                    video.close()
+                if temporary is not None and temporary.exists():
+                    temporary.unlink()
+        return video_path
+
     def increase_video_speed(self, video_path, speed_factor=1.5):
         """Produce a completed MP4 before replacing the source video.
 
@@ -268,8 +280,8 @@ class YouTubeDownloader:
                 sped_up_video.close()
             if video is not None:
                 video.close()
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
 
     def process_video(self, url):
         """Process a single video URL"""
@@ -298,7 +310,7 @@ class YouTubeDownloader:
             # Reduce quality if too large
             if file_size_mb > 500:
                 logger.info("Video is too large, reducing quality...")
-                self.reduce_video_quality(video_path)
+                video_path = self.reduce_video_quality(video_path)
                 
                 # Check new size
                 new_size_mb = video_path.stat().st_size / (1024 * 1024)
@@ -323,7 +335,7 @@ class YouTubeDownloader:
         """Process all URLs from a text file"""
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
-            return
+            return False
         
         with open(file_path, 'r', encoding='utf-8') as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -341,6 +353,7 @@ class YouTubeDownloader:
                 failed += 1
         
         logger.info(f"Processing complete. Successful: {successful}, Failed: {failed}")
+        return failed == 0
 
 def main():
     # Check for FFmpeg (required for moviepy)
@@ -365,7 +378,7 @@ def main():
         logger.info("Or specify the file path as an argument")
         sys.exit(1)
     
-    downloader.process_urls_from_file(urls_file)
+    return 0 if downloader.process_urls_from_file(urls_file) else 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
