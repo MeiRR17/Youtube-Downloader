@@ -7,6 +7,9 @@ from urllib.parse import urlparse, parse_qs
 import yt_dlp
 from moviepy.editor import VideoFileClip
 import logging
+import hashlib
+import json
+import tempfile
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,6 +21,79 @@ class YouTubeDownloader:
         self.base_folder = self.desktop_path / "Youtube-Videos"
         self.base_folder.mkdir(exist_ok=True)
         
+    def read_processed_receipts(self):
+        """Load the completed-video index without destroying invalid data."""
+        path = self.base_folder / ".processed-videos.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or not isinstance(data.get("videos"), dict)):
+            raise ValueError(f"Invalid processing index: {path}")
+        return data["videos"]
+
+    @staticmethod
+    def file_sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def processed_file(self, video_id, receipts):
+        """Return an unchanged previously processed MP4, or None."""
+        record = receipts.get(video_id)
+        if not isinstance(record, dict) or record.get("speed_factor") != 1.5:
+            return None
+        relative = record.get("path")
+        if not isinstance(relative, str) or not relative:
+            return None
+        path = self.base_folder / relative
+        root = self.base_folder.resolve()
+        if not path.resolve().is_relative_to(root) or not path.is_file():
+            return None
+        metadata = path.stat()
+        if (metadata.st_size <= 0 or metadata.st_size != record.get("size_bytes")
+                or metadata.st_mtime_ns != record.get("mtime_ns")):
+            return None
+        if self.file_sha256(path) != record.get("sha256"):
+            return None
+        return path
+
+    def record_processed_file(self, video_id, path, receipts):
+        """Write the receipt only after the final MP4 has been produced."""
+        root = self.base_folder.resolve()
+        actual = path.resolve()
+        if not actual.is_relative_to(root) or not actual.is_file():
+            raise ValueError("Processed video is outside the output directory")
+        metadata = actual.stat()
+        updated = dict(receipts)
+        updated[video_id] = {
+            "path": actual.relative_to(root).as_posix(),
+            "size_bytes": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "sha256": self.file_sha256(actual),
+            "speed_factor": 1.5,
+        }
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=root,
+                prefix=".processed-videos-", suffix=".tmp", delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump({"schema_version": 1, "videos": updated}, stream,
+                          ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, root / ".processed-videos.json")
+            temporary = None
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
     def extract_topic_from_title(self, title):
         """Extract topic from video title (1-2 words)"""
         # Common programming topics and keywords
@@ -133,42 +209,68 @@ class YouTubeDownloader:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
+                'id': info.get('id'),
                 'title': info.get('title', 'Unknown'),
                 'duration': info.get('duration', 0),
                 'filesize': info.get('filesize', 0)
             }
     
     def download_video(self, url, output_path):
-        """Download video from YouTube"""
+        """Download one video and return its actual file, never a directory guess.
+
+        Include the YouTube ID in the filename to distinguish videos with
+        identical titles. yt-dlp reports the actual downloaded filepath.
+        """
         ydl_opts = {
-            'outtmpl': str(output_path / '%(title)s.%(ext)s'),
-            'format': 'best[height<=720]',  # Start with 720p max
+            'outtmpl': str(output_path / '%(title).120B [%(id)s].%(ext)s'),
+            'format': 'best[height<=720]/best',
+            'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
         }
-        
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
+            if not isinstance(info, dict) or info.get('_type') == 'playlist':
+                raise ValueError("Expected a single video, not a playlist")
+            requested = info.get('requested_downloads') or []
+            candidates = [
+                item.get('filepath') for item in requested
+                if isinstance(item, dict) and item.get('filepath')
+            ]
+            candidates.extend([info.get('_filename'), ydl.prepare_filename(info)])
+            output_dir = output_path.resolve()
+            for filename in candidates:
+                if not filename:
+                    continue
+                actual = Path(filename)
+                if actual.is_file() and actual.resolve().parent == output_dir:
+                    return actual
+            raise FileNotFoundError("yt-dlp completed without an output file in the topic folder")
     
     def reduce_video_quality(self, video_path, max_size_mb=480):
-        """Reduce video quality to meet size requirements"""
-        video = VideoFileClip(str(video_path))
-        
-        # Try different quality settings
+        """Try smaller MP4 encodings without deleting a usable original."""
         quality_settings = [
             {'height': 480, 'bitrate': '500k'},
             {'height': 360, 'bitrate': '300k'},
             {'height': 240, 'bitrate': '200k'},
         ]
-        
         for settings in quality_settings:
-            temp_path = video_path.parent / f"temp_{video_path.name}"
-            
+            video = None
+            resized_video = None
+            temporary = None
             try:
-                # Resize and compress
-                resized_video = video.resize(height=settings['height'])
+                descriptor, name = tempfile.mkstemp(
+                    prefix=".quality-", suffix=".mp4", dir=video_path.parent
+                )
+                os.close(descriptor)
+                temporary = Path(name)
+                video = VideoFileClip(str(video_path))
+                resized_video = video.resize(
+                    height=min(settings['height'], video.h)
+                )
                 resized_video.write_videofile(
-                    str(temp_path),
+                    str(temporary),
                     bitrate=settings['bitrate'],
                     audio_bitrate='64k',
                     codec='libx264',
@@ -176,59 +278,87 @@ class YouTubeDownloader:
                     verbose=False,
                     logger=None
                 )
-                
-                # Check file size
-                temp_size_mb = temp_path.stat().st_size / (1024 * 1024)
-                
-                if temp_size_mb <= max_size_mb:
-                    # Replace original with compressed version
+                size = temporary.stat().st_size
+                if not 0 < size <= max_size_mb * 1024 * 1024:
+                    continue
+
+                resized_video.close()
+                resized_video = None
+                video.close()
+                video = None
+                final_path = video_path.with_suffix('.mp4')
+                os.replace(temporary, final_path)
+                temporary = None
+                if final_path != video_path:
                     video_path.unlink()
-                    temp_path.rename(video_path)
-                    logger.info(f"Reduced video quality to {settings['height']}p, size: {temp_size_mb:.1f}MB")
-                    break
-                else:
-                    temp_path.unlink()
-                    
-            except Exception as e:
-                logger.error(f"Error reducing quality: {e}")
-                if temp_path.exists():
-                    temp_path.unlink()
-                continue
-        
-        video.close()
-    
+                logger.info(
+                    f"Reduced video quality to {settings['height']}p, "
+                    f"size: {size / (1024 * 1024):.1f}MB"
+                )
+                return final_path
+            except Exception as exc:
+                logger.error(f"Error reducing quality: {exc}")
+            finally:
+                if resized_video is not None:
+                    resized_video.close()
+                if video is not None:
+                    video.close()
+                if temporary is not None and temporary.exists():
+                    temporary.unlink()
+        return video_path
+
     def increase_video_speed(self, video_path, speed_factor=1.5):
-        """Increase video playback speed"""
+        """Produce a completed MP4 before replacing the source video.
+
+        Keep the input untouched if encoding fails. A unique temporary file
+        prevents unrelated jobs or interrupted runs from overwriting outputs.
+        """
+        video = None
+        sped_up_video = None
+        temporary = None
         try:
+            descriptor, name = tempfile.mkstemp(
+                prefix=".speed-", suffix=".mp4", dir=video_path.parent
+            )
+            os.close(descriptor)
+            temporary = Path(name)
             video = VideoFileClip(str(video_path))
-            
-            # Increase speed
-            sped_up_video = video.fl_time(lambda t: t / speed_factor, apply_to=['video', 'audio'])
+            sped_up_video = video.fl_time(
+                lambda t: t / speed_factor, apply_to=['video', 'audio']
+            )
             sped_up_video.fps = video.fps
-            
-            temp_path = video_path.parent / f"sped_up_{video_path.name}"
-            
-            # Write sped up video
             sped_up_video.write_videofile(
-                str(temp_path),
+                str(temporary),
                 codec='libx264',
                 audio_codec='aac',
                 verbose=False,
                 logger=None
             )
-            
-            # Replace original
-            video_path.unlink()
-            temp_path.rename(video_path)
-            
-            video.close()
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise RuntimeError("Speed encoding produced an empty output")
+            # Close media handles before replacement, including on Windows.
             sped_up_video.close()
-            
+            sped_up_video = None
+            video.close()
+            video = None
+            final_path = video_path.with_suffix('.mp4')
+            os.replace(temporary, final_path)
+            temporary = None
+            if final_path != video_path:
+                video_path.unlink()
             logger.info(f"Increased video speed by {speed_factor}x")
-            
-        except Exception as e:
-            logger.error(f"Error increasing video speed: {e}")
-    
+            return final_path
+        except Exception as exc:
+            logger.error(f"Error increasing video speed: {exc}")
+            return None
+        finally:
+            if sped_up_video is not None:
+                sped_up_video.close()
+            if video is not None:
+                video.close()
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
     def process_video(self, url):
         """Process a single video URL"""
         try:
@@ -236,29 +366,27 @@ class YouTubeDownloader:
             
             # Get video info
             info = self.get_video_info(url)
+            video_id = info['id']
+            if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                raise ValueError("Could not identify a single YouTube video ID")
             title = info['title']
             logger.info(f"Video title: {title}")
+
+            receipts = self.read_processed_receipts()
+            already_processed = self.processed_file(video_id, receipts)
+            if already_processed is not None:
+                logger.info(f"SKIP already processed: {video_id} -> {already_processed}")
+                return True
             
             # Extract topic and create folder
             topic = self.extract_topic_from_title(title)
             topic_folder = self.base_folder / topic
             topic_folder.mkdir(exist_ok=True)
             
-            # Download video
+            # Operate only on this download, not an unrelated earlier video
+            # in the same topic directory.
             logger.info("Downloading video...")
-            self.download_video(url, topic_folder)
-            
-            # Find downloaded video file
-            video_files = list(topic_folder.glob("*.mp4")) + list(topic_folder.glob("*.webm")) + list(topic_folder.glob("*.mkv"))
-            if not video_files:
-                video_files = list(topic_folder.glob("*"))
-                video_files = [f for f in video_files if f.is_file() and f.suffix in ['.mp4', '.webm', '.mkv']]
-            
-            if not video_files:
-                logger.error(f"No video file found for {title}")
-                return False
-            
-            video_path = video_files[0]  # Take the first (should be only one)
+            video_path = self.download_video(url, topic_folder)
             
             # Check file size
             file_size_mb = video_path.stat().st_size / (1024 * 1024)
@@ -267,7 +395,7 @@ class YouTubeDownloader:
             # Reduce quality if too large
             if file_size_mb > 500:
                 logger.info("Video is too large, reducing quality...")
-                self.reduce_video_quality(video_path)
+                video_path = self.reduce_video_quality(video_path)
                 
                 # Check new size
                 new_size_mb = video_path.stat().st_size / (1024 * 1024)
@@ -276,8 +404,12 @@ class YouTubeDownloader:
             
             # Increase speed
             logger.info("Increasing video speed...")
-            self.increase_video_speed(video_path)
-            
+            processed_path = self.increase_video_speed(video_path)
+            if processed_path is None:
+                return False
+            video_path = processed_path
+            self.record_processed_file(video_id, video_path, receipts)
+
             logger.info(f"Successfully processed: {title} -> {topic}/{video_path.name}")
             return True
             
@@ -289,7 +421,7 @@ class YouTubeDownloader:
         """Process all URLs from a text file"""
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
-            return
+            return False
         
         with open(file_path, 'r', encoding='utf-8') as f:
             urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -307,6 +439,7 @@ class YouTubeDownloader:
                 failed += 1
         
         logger.info(f"Processing complete. Successful: {successful}, Failed: {failed}")
+        return failed == 0
 
 def main():
     # Check for FFmpeg (required for moviepy)
@@ -331,7 +464,7 @@ def main():
         logger.info("Or specify the file path as an argument")
         sys.exit(1)
     
-    downloader.process_urls_from_file(urls_file)
+    return 0 if downloader.process_urls_from_file(urls_file) else 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

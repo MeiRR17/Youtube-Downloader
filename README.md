@@ -9,6 +9,7 @@ A Python script that downloads YouTube videos, increases their speed by 1.5x, ma
 ## Features
 
 - Downloads YouTube videos from a text file (one URL per line)
+- Tracks the exact file returned by yt-dlp; videos with identical titles have distinct ID-suffixed filenames
 - Increases video playback speed by 1.5x
 - Automatically reduces quality for videos > 500MB to < 480MB
 - Organizes videos by topic in subfolders
@@ -95,9 +96,31 @@ https://youtu.be/abc123def456
 - The script includes comprehensive error handling and logging
 - Failed downloads are logged but don't stop the entire process
 - Temporary files are cleaned up automatically
+- Quality and speed changes are encoded into unique temporary MP4 files and promoted only after success
+- A failed speed conversion marks that URL as failed, and any failed URL gives the CLI a nonzero exit status
 
 ## Notes
 
 - Processing time depends on video length and your internet speed
 - Large videos may take longer to process due to quality reduction
 - FFmpeg is required for video processing operations
+
+## File isolation and safe video processing
+
+Each requested YouTube URL is downloaded as a **single video** (`noplaylist`), with a filename containing the video's unique YouTube ID. The downloader processes only the file path returned by `yt-dlp` for that request; other MP4, WebM, or MKV files in the same topic folder are never selected by broad directory globbing.
+
+When a download is larger than 500 MiB, the script tries to compress it below 480 MiB. Compression produces a temporary MP4 and promotes it only when the output meets the size requirement. Failed compression leaves the existing source intact and logs a warning if the size target is still not met.
+
+The 1.5× speed operation likewise encodes to a unique temporary MP4. It closes the media file handles before atomically replacing the destination (including on Windows). If the encoding fails, it removes the temporary output and leaves the original file untouched; the URL is reported as failed.
+
+`python youtube_downloader.py urls.txt` now returns **exit code 1** if one or more URLs cannot be processed, and 0 only when every URL succeeds. The script continues processing subsequent URLs after an individual failure. Installation still requires `yt-dlp`, `moviepy`, and the FFmpeg executable.
+
+## Safe repeated runs (processed-video receipts)
+
+The downloader now maintains an atomic processing index at `Desktop/Youtube-Videos/.processed-videos.json`, keyed by YouTube's 11-character video ID. After a successful 1.5× conversion, the index records the exact relative MP4 path, byte size, modification timestamp, SHA-256, and speed setting. On a subsequent invocation, the downloader verifies the on-disk file against this receipt **before downloading or converting it again**. An unchanged previously processed file is skipped, including duplicate URLs within the same input file.
+
+An index entry with a missing file, altered checksum, timestamp or size is treated as stale and the URL is processed again. An unreadable or malformed index causes the affected URLs to fail rather than silently deleting existing processing history. The index is written through a uniquely named temporary file and atomically replaced, with file contents synced before the rename.
+
+Receipts apply to successful processing carried out by this new version. Videos processed using the old implementation do not have receipts and cannot be safely recognized as already sped up. If a process crashes after completing conversion but **before** recording its receipt, that conversion is not yet covered by the index. Keep the `.processed-videos.json` file with the output folder when moving or backing up your library. Concurrent runs writing to the same library are not supported, because they can overwrite each other's receipts.
+
+This capability is implemented in the standalone repository; the older copy consolidated into `Learning_Modules/tools/youtube-downloader` is not automatically updated by this PR.
