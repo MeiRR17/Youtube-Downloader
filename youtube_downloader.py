@@ -7,6 +7,7 @@ from urllib.parse import urlparse, parse_qs
 import yt_dlp
 from moviepy.editor import VideoFileClip
 import logging
+import tempfile
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -219,37 +220,57 @@ class YouTubeDownloader:
         video.close()
     
     def increase_video_speed(self, video_path, speed_factor=1.5):
-        """Increase video playback speed"""
+        """Produce a completed MP4 before replacing the source video.
+
+        Keep the input untouched if encoding fails. A unique temporary file
+        prevents unrelated jobs or interrupted runs from overwriting outputs.
+        """
+        video = None
+        sped_up_video = None
+        temporary = None
         try:
+            descriptor, name = tempfile.mkstemp(
+                prefix=".speed-", suffix=".mp4", dir=video_path.parent
+            )
+            os.close(descriptor)
+            temporary = Path(name)
             video = VideoFileClip(str(video_path))
-            
-            # Increase speed
-            sped_up_video = video.fl_time(lambda t: t / speed_factor, apply_to=['video', 'audio'])
+            sped_up_video = video.fl_time(
+                lambda t: t / speed_factor, apply_to=['video', 'audio']
+            )
             sped_up_video.fps = video.fps
-            
-            temp_path = video_path.parent / f"sped_up_{video_path.name}"
-            
-            # Write sped up video
             sped_up_video.write_videofile(
-                str(temp_path),
+                str(temporary),
                 codec='libx264',
                 audio_codec='aac',
                 verbose=False,
                 logger=None
             )
-            
-            # Replace original
-            video_path.unlink()
-            temp_path.rename(video_path)
-            
-            video.close()
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise RuntimeError("Speed encoding produced an empty output")
+            # Close media handles before replacement, including on Windows.
             sped_up_video.close()
-            
+            sped_up_video = None
+            video.close()
+            video = None
+            final_path = video_path.with_suffix('.mp4')
+            os.replace(temporary, final_path)
+            temporary = None
+            if final_path != video_path:
+                video_path.unlink()
             logger.info(f"Increased video speed by {speed_factor}x")
-            
-        except Exception as e:
-            logger.error(f"Error increasing video speed: {e}")
-    
+            return final_path
+        except Exception as exc:
+            logger.error(f"Error increasing video speed: {exc}")
+            return None
+        finally:
+            if sped_up_video is not None:
+                sped_up_video.close()
+            if video is not None:
+                video.close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def process_video(self, url):
         """Process a single video URL"""
         try:
@@ -286,8 +307,10 @@ class YouTubeDownloader:
             
             # Increase speed
             logger.info("Increasing video speed...")
-            if not self.increase_video_speed(video_path):
+            processed_path = self.increase_video_speed(video_path)
+            if processed_path is None:
                 return False
+            video_path = processed_path
 
             logger.info(f"Successfully processed: {title} -> {topic}/{video_path.name}")
             return True
