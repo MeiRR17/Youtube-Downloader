@@ -115,4 +115,12 @@ The 1.5× speed operation likewise encodes to a unique temporary MP4. It closes 
 
 `python youtube_downloader.py urls.txt` now returns **exit code 1** if one or more URLs cannot be processed, and 0 only when every URL succeeds. The script continues processing subsequent URLs after an individual failure. Installation still requires `yt-dlp`, `moviepy`, and the FFmpeg executable.
 
-This change does not yet implement an archive or processed-video receipt. Re-running the same URL may reapply the speed transformation to its existing video; avoid repeated runs against previously processed outputs until idempotent processing is added.
+## Safe repeated runs (processed-video receipts)
+
+The downloader now maintains an atomic processing index at `Desktop/Youtube-Videos/.processed-videos.json`, keyed by YouTube's 11-character video ID. After a successful 1.5× conversion, the index records the exact relative MP4 path, byte size, modification timestamp, SHA-256, and speed setting. On a subsequent invocation, the downloader verifies the on-disk file against this receipt **before downloading or converting it again**. An unchanged previously processed file is skipped, including duplicate URLs within the same input file.
+
+An index entry with a missing file, altered checksum, timestamp or size is treated as stale and the URL is processed again. An unreadable or malformed index causes the affected URLs to fail rather than silently deleting existing processing history. The index is written through a uniquely named temporary file and atomically replaced, with file contents synced before the rename.
+
+Receipts apply to successful processing carried out by this new version. Videos processed using the old implementation do not have receipts and cannot be safely recognized as already sped up. If a process crashes after completing conversion but **before** recording its receipt, that conversion is not yet covered by the index. Keep the `.processed-videos.json` file with the output folder when moving or backing up your library. Concurrent runs writing to the same library are not supported, because they can overwrite each other's receipts.
+
+This capability is implemented in the standalone repository; the older copy consolidated into `Learning_Modules/tools/youtube-downloader` is not automatically updated by this PR.
