@@ -7,6 +7,8 @@ from urllib.parse import urlparse, parse_qs
 import yt_dlp
 from moviepy.editor import VideoFileClip
 import logging
+import hashlib
+import json
 import tempfile
 
 # Set up logging
@@ -19,6 +21,79 @@ class YouTubeDownloader:
         self.base_folder = self.desktop_path / "Youtube-Videos"
         self.base_folder.mkdir(exist_ok=True)
         
+    def read_processed_receipts(self):
+        """Load the completed-video index without destroying invalid data."""
+        path = self.base_folder / ".processed-videos.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or not isinstance(data.get("videos"), dict)):
+            raise ValueError(f"Invalid processing index: {path}")
+        return data["videos"]
+
+    @staticmethod
+    def file_sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def processed_file(self, video_id, receipts):
+        """Return an unchanged previously processed MP4, or None."""
+        record = receipts.get(video_id)
+        if not isinstance(record, dict) or record.get("speed_factor") != 1.5:
+            return None
+        relative = record.get("path")
+        if not isinstance(relative, str) or not relative:
+            return None
+        path = self.base_folder / relative
+        root = self.base_folder.resolve()
+        if not path.resolve().is_relative_to(root) or not path.is_file():
+            return None
+        metadata = path.stat()
+        if (metadata.st_size <= 0 or metadata.st_size != record.get("size_bytes")
+                or metadata.st_mtime_ns != record.get("mtime_ns")):
+            return None
+        if self.file_sha256(path) != record.get("sha256"):
+            return None
+        return path
+
+    def record_processed_file(self, video_id, path, receipts):
+        """Write the receipt only after the final MP4 has been produced."""
+        root = self.base_folder.resolve()
+        actual = path.resolve()
+        if not actual.is_relative_to(root) or not actual.is_file():
+            raise ValueError("Processed video is outside the output directory")
+        metadata = actual.stat()
+        updated = dict(receipts)
+        updated[video_id] = {
+            "path": actual.relative_to(root).as_posix(),
+            "size_bytes": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "sha256": self.file_sha256(actual),
+            "speed_factor": 1.5,
+        }
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=root,
+                prefix=".processed-videos-", suffix=".tmp", delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump({"schema_version": 1, "videos": updated}, stream,
+                          ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, root / ".processed-videos.json")
+            temporary = None
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
     def extract_topic_from_title(self, title):
         """Extract topic from video title (1-2 words)"""
         # Common programming topics and keywords
@@ -134,6 +209,7 @@ class YouTubeDownloader:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
+                'id': info.get('id'),
                 'title': info.get('title', 'Unknown'),
                 'duration': info.get('duration', 0),
                 'filesize': info.get('filesize', 0)
@@ -290,8 +366,17 @@ class YouTubeDownloader:
             
             # Get video info
             info = self.get_video_info(url)
+            video_id = info['id']
+            if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                raise ValueError("Could not identify a single YouTube video ID")
             title = info['title']
             logger.info(f"Video title: {title}")
+
+            receipts = self.read_processed_receipts()
+            already_processed = self.processed_file(video_id, receipts)
+            if already_processed is not None:
+                logger.info(f"SKIP already processed: {video_id} -> {already_processed}")
+                return True
             
             # Extract topic and create folder
             topic = self.extract_topic_from_title(title)
@@ -323,6 +408,7 @@ class YouTubeDownloader:
             if processed_path is None:
                 return False
             video_path = processed_path
+            self.record_processed_file(video_id, video_path, receipts)
 
             logger.info(f"Successfully processed: {title} -> {topic}/{video_path.name}")
             return True
