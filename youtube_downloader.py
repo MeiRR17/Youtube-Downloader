@@ -139,16 +139,37 @@ class YouTubeDownloader:
             }
     
     def download_video(self, url, output_path):
-        """Download video from YouTube"""
+        """Download one video and return its actual file, never a directory guess.
+
+        Include the YouTube ID in the filename to distinguish videos with
+        identical titles. yt-dlp reports the actual downloaded filepath.
+        """
         ydl_opts = {
-            'outtmpl': str(output_path / '%(title)s.%(ext)s'),
-            'format': 'best[height<=720]',  # Start with 720p max
+            'outtmpl': str(output_path / '%(title).120B [%(id)s].%(ext)s'),
+            'format': 'best[height<=720]/best',
+            'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
         }
-        
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
+            if not isinstance(info, dict) or info.get('_type') == 'playlist':
+                raise ValueError("Expected a single video, not a playlist")
+            requested = info.get('requested_downloads') or []
+            candidates = [
+                item.get('filepath') for item in requested
+                if isinstance(item, dict) and item.get('filepath')
+            ]
+            candidates.extend([info.get('_filename'), ydl.prepare_filename(info)])
+            output_dir = output_path.resolve()
+            for filename in candidates:
+                if not filename:
+                    continue
+                actual = Path(filename)
+                if actual.is_file() and actual.resolve().parent == output_dir:
+                    return actual
+            raise FileNotFoundError("yt-dlp completed without an output file in the topic folder")
     
     def reduce_video_quality(self, video_path, max_size_mb=480):
         """Reduce video quality to meet size requirements"""
@@ -244,21 +265,10 @@ class YouTubeDownloader:
             topic_folder = self.base_folder / topic
             topic_folder.mkdir(exist_ok=True)
             
-            # Download video
+            # Operate only on this download, not an unrelated earlier video
+            # in the same topic directory.
             logger.info("Downloading video...")
-            self.download_video(url, topic_folder)
-            
-            # Find downloaded video file
-            video_files = list(topic_folder.glob("*.mp4")) + list(topic_folder.glob("*.webm")) + list(topic_folder.glob("*.mkv"))
-            if not video_files:
-                video_files = list(topic_folder.glob("*"))
-                video_files = [f for f in video_files if f.is_file() and f.suffix in ['.mp4', '.webm', '.mkv']]
-            
-            if not video_files:
-                logger.error(f"No video file found for {title}")
-                return False
-            
-            video_path = video_files[0]  # Take the first (should be only one)
+            video_path = self.download_video(url, topic_folder)
             
             # Check file size
             file_size_mb = video_path.stat().st_size / (1024 * 1024)
@@ -276,8 +286,9 @@ class YouTubeDownloader:
             
             # Increase speed
             logger.info("Increasing video speed...")
-            self.increase_video_speed(video_path)
-            
+            if not self.increase_video_speed(video_path):
+                return False
+
             logger.info(f"Successfully processed: {title} -> {topic}/{video_path.name}")
             return True
             
